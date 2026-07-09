@@ -522,6 +522,23 @@ def _venv_key(deps):
     return hashlib.sha256(("cpython312\n" + "\n".join(sorted(set(deps) | {"pytest"}))).encode()).hexdigest()[:16]
 
 
+def _run_capped(cmd, timeout, env=None, cwd=None):
+    """Run a command with a wall-clock cap. Returns (returncode, combined_output).
+
+    A timeout becomes a clean failure (rc 124) with a message, so a stuck
+    connection never hangs a grade or the selftest — it fails and says why.
+    """
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, env=env, cwd=cwd,
+                              stdin=subprocess.DEVNULL, timeout=timeout)
+        return proc.returncode, proc.stdout + proc.stderr
+    except subprocess.TimeoutExpired as e:
+        out = (e.stdout or "") + (e.stderr or "")
+        if isinstance(out, bytes):
+            out = out.decode(errors="replace")
+        return 124, out + f"\n[pgtrain] timed out after {timeout}s"
+
+
 def run_app_pytest(meta, ws, db):
     """Run a task's pytest grader against the live DB. Returns (returncode, note, output).
 
@@ -543,13 +560,12 @@ def run_app_pytest(meta, ws, db):
             "PGTRAIN_DSN": dsn_for(db), "PYTHONPATH": str(GRADER_LIB),
         })
         env.pop("PYTEST_ADDOPTS", None)
-        proc = subprocess.run(
+        rc, out = _run_capped(
             [exe, "-m", "pytest", str(grader), "-q", "--no-header",
              "-p", "no:cacheprovider", "--rootdir", str(ws), "-x", "--tb=short"],
-            capture_output=True, text=True, env=env, cwd=str(ws),
-            stdin=subprocess.DEVNULL, timeout=meta.get("timeout", 180),
+            timeout=meta.get("timeout", 180), env=env, cwd=str(ws),
         )
-        return proc.returncode, None, proc.stdout + proc.stderr
+        return rc, None, out
 
     # VPN fallback. A NordLynx-style VPN breaks the Docker bridge's return path,
     # so BOTH the host->Postgres data path AND a bridge container's egress to
@@ -572,15 +588,14 @@ def run_app_pytest(meta, ws, db):
         '  touch "$V/ok"\n'
         "fi\n"
     )
-    p = subprocess.run(
+    prc, pout = _run_capped(
         ["docker", "run", "--rm", "--network", "host",
          "-v", f"{VENV_VOLUME}:/venvs", "-v", f"{PIP_VOLUME}:/root/.cache/pip",
          APP_IMAGE, "bash", "-lc", provision],
-        capture_output=True, text=True, stdin=subprocess.DEVNULL,
         timeout=meta.get("timeout", 180) + 600,
     )
-    if p.returncode != 0:
-        return p.returncode, None, "venv provisioning failed:\n" + p.stdout + p.stderr
+    if prc != 0:
+        return prc, None, "venv provisioning failed:\n" + pout
 
     container_dsn = f"postgresql://{PGUSER}@{CONTAINER}:5432/{db}"
     run_pytest = (
@@ -603,9 +618,8 @@ def run_app_pytest(meta, ws, db):
         "-v", f"{VENV_VOLUME}:/venvs",
         APP_IMAGE, "bash", "-lc", run_pytest,
     ]
-    proc = subprocess.run(run_args, capture_output=True, text=True,
-                          stdin=subprocess.DEVNULL, timeout=meta.get("timeout", 180) + 120)
-    return proc.returncode, None, proc.stdout + proc.stderr
+    rc, out = _run_capped(run_args, timeout=meta.get("timeout", 180) + 120)
+    return rc, None, out
 
 
 def grade_app(tid, meta, db=None, ws=None):
