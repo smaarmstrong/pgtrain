@@ -1,0 +1,889 @@
+#!/usr/bin/env python3
+"""
+pgtrain — a console trainer for the whole of PostgreSQL, from SQL craft to
+production admin, with a DevOps slant.
+
+Every task is graded against a REAL Postgres running in Docker — never against
+SQL text. There are three kinds of task:
+
+    query  you write a SELECT in solution.sql; the grader runs it AND the
+           reference against the seeded database and compares the *result sets*
+           (order-insensitive unless the task says otherwise, types and NULLs
+           normalised, column names ignored). Any correct query passes.
+
+    state  you apply DDL/DML/admin changes interactively with `pgtrain psql`;
+           the grader asserts the END STATE via the system catalogs, EXPLAIN
+           plan shape, and behaviour probes. It never reads your SQL text.
+
+    app    you edit Python files (SQLAlchemy, Alembic, asyncpg, FastAPI ...);
+           the grader runs pytest in a cached venv against the same Docker
+           Postgres.
+
+Usage:
+    pgtrain list [domain]        # all tasks, grouped by domain, with your status
+    pgtrain start  <id>          # create the task's database (+ workspace) and show the spec
+    pgtrain psql   <id>          # open an interactive psql shell on the task database
+    pgtrain check  <id>          # grade your work
+    pgtrain solution <id>        # reveal a reference solution
+    pgtrain reset  <id>          # drop & recreate the task database (and reset workspace files)
+    pgtrain status               # your XP, streak, and per-domain completion
+
+    pgtrain up                   # start the shared postgres:16 container
+    pgtrain down                 # stop it (data is preserved)
+    pgtrain gc                   # drop every pgtrain_* database (frees space; safe)
+    pgtrain nuke                 # remove the container entirely (destroys all task data)
+    pgtrain doctor               # show container / database health
+
+<id> is "domain/nn-name" or just the unique trailing name.
+
+The only hard requirement is Docker. The runner itself is Python >= 3.11,
+standard library only. SQL/state tasks talk to Postgres through
+`docker exec ... psql` — no host psql, no driver needed. App tasks additionally
+provision a per-dependency-set venv (uv if present, else venv+pip).
+
+SAFETY: the runner touches ONLY the container named `pgtrain-pg` and databases
+whose names begin with `pgtrain_`. It never issues a global drop and never
+touches anything unprefixed.
+"""
+import hashlib
+import json
+import os
+import re
+import shlex
+import shutil
+import struct
+import subprocess
+import sys
+import time
+from datetime import date, timedelta
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+TASKS = REPO / "tasks"
+WORKSPACE = REPO / "workspace"
+GRADER_LIB = REPO / "grader"
+STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "pgtrain"
+STATE = STATE_DIR / "progress.json"
+VENVS = STATE_DIR / "venvs"
+MIN_PY = (3, 11)
+
+# ---- container / connection facts ------------------------------------------
+CONTAINER = os.environ.get("PGTRAIN_CONTAINER", "pgtrain-pg")
+IMAGE = os.environ.get("PGTRAIN_IMAGE", "postgres:16")
+NETWORK = os.environ.get("PGTRAIN_NETWORK", "pgtrain-net")
+HOST_ADDR = os.environ.get("PGTRAIN_HOST", "127.0.0.1")
+HOST_PORT = os.environ.get("PGTRAIN_PORT", "55432")
+PGUSER = "postgres"
+DB_PREFIX = "pgtrain_"
+PRELOAD = "pg_stat_statements"
+APP_IMAGE = os.environ.get("PGTRAIN_APP_IMAGE", "python:3.12")
+VENV_VOLUME = "pgtrain-venvs"
+PIP_VOLUME = "pgtrain-pipcache"
+
+# ---- colours ---------------------------------------------------------------
+_tty = sys.stdout.isatty()
+def c(code, s):
+    return f"\033[{code}m{s}\033[0m" if _tty else s
+GRN = lambda s: c("32", s)
+RED = lambda s: c("31", s)
+YEL = lambda s: c("33", s)
+BLU = lambda s: c("34", s)
+MAG = lambda s: c("35", s)
+DIM = lambda s: c("2", s)
+BLD = lambda s: c("1", s)
+
+XP_BY_DIFFICULTY = {1: 10, 2: 15, 3: 25, 4: 40, 5: 60}
+
+
+def die(msg):
+    print(RED(f"error: {msg}"), file=sys.stderr)
+    sys.exit(1)
+
+
+# ---- state -----------------------------------------------------------------
+def load_state():
+    try:
+        return json.loads(STATE.read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {"tasks": {}, "xp": 0, "streak": {"count": 0, "last": ""}}
+
+
+def save_state(st):
+    STATE.parent.mkdir(parents=True, exist_ok=True)
+    STATE.write_text(json.dumps(st, indent=2))
+
+
+def bump_streak(st):
+    today = date.today()
+    s = st["streak"]
+    if s["last"] == today.isoformat():
+        return
+    if s.get("last") and date.fromisoformat(s["last"]) == today - timedelta(days=1):
+        s["count"] += 1
+    else:
+        s["count"] = 1
+    s["last"] = today.isoformat()
+
+
+# ---- task discovery --------------------------------------------------------
+def discover():
+    """Return {task_id: meta_dict} for every task dir holding a meta.json."""
+    tasks = {}
+    if not TASKS.is_dir():
+        return tasks
+    for meta_path in sorted(TASKS.glob("*/*/meta.json")):
+        d = meta_path.parent
+        tid = f"{d.parent.name}/{d.name}"
+        try:
+            meta = json.loads(meta_path.read_text())
+        except json.JSONDecodeError as e:
+            print(YEL(f"warning: bad meta.json in {tid}: {e}"), file=sys.stderr)
+            continue
+        meta["_dir"] = d
+        meta.setdefault("kind", "query")
+        tasks[tid] = meta
+    return tasks
+
+
+def resolve(tasks, ident):
+    if ident in tasks:
+        return ident
+    hits = [t for t in tasks if t.split("/", 1)[1] == ident]
+    if not hits:
+        hits = [t for t in tasks if re.sub(r"^\d+-", "", t.split("/", 1)[1]) == ident]
+    if len(hits) == 1:
+        return hits[0]
+    if len(hits) > 1:
+        die(f"'{ident}' is ambiguous: {', '.join(hits)}")
+    die(f"no task called '{ident}' (try: pgtrain list)")
+
+
+def task_db(tid):
+    """Deterministic, always-pgtrain_-prefixed database name for a task."""
+    slug = re.sub(r"[^a-z0-9]+", "_", tid.lower()).strip("_")
+    name = f"{DB_PREFIX}{slug}"
+    if len(name) > 60:
+        h = hashlib.sha1(tid.encode()).hexdigest()[:8]
+        name = name[:51] + "_" + h
+    return name
+
+
+# ---- docker / postgres plumbing --------------------------------------------
+def _docker(args, check=True, capture=True, text=True, input=None, tty=False):
+    cmd = ["docker", *args]
+    if tty:
+        return subprocess.run(cmd)
+    return subprocess.run(cmd, check=check, capture_output=capture, text=text,
+                          input=input, stdin=None if input is not None else subprocess.DEVNULL)
+
+
+def _have_docker():
+    if not shutil.which("docker"):
+        die("Docker is required but `docker` is not on your PATH.")
+    r = _docker(["info"], check=False)
+    if r.returncode != 0:
+        die("Docker is installed but the daemon is not reachable — is it running?")
+
+
+def container_state():
+    """'running', 'stopped', or 'absent'."""
+    r = _docker(["inspect", "-f", "{{.State.Running}}", CONTAINER], check=False)
+    if r.returncode != 0:
+        return "absent"
+    return "running" if r.stdout.strip() == "true" else "stopped"
+
+
+def _ensure_network():
+    if _docker(["network", "inspect", NETWORK], check=False).returncode != 0:
+        _docker(["network", "create", NETWORK])
+
+
+def ensure_up(quiet=False):
+    _have_docker()
+    _ensure_network()
+    state = container_state()
+    if state == "running":
+        # An older container may predate the network — attach it (no-op if already).
+        _docker(["network", "connect", NETWORK, CONTAINER], check=False)
+    elif state == "stopped":
+        if not quiet:
+            print(DIM(f"starting container {CONTAINER}..."))
+        _docker(["start", CONTAINER])
+        _docker(["network", "connect", NETWORK, CONTAINER], check=False)
+    else:
+        if not quiet:
+            print(DIM(f"creating container {CONTAINER} from {IMAGE} "
+                      f"(first run pulls the image)..."))
+        _docker([
+            "run", "-d", "--name", CONTAINER,
+            "--network", NETWORK,
+            "-e", "POSTGRES_HOST_AUTH_METHOD=trust",
+            "-e", "POSTGRES_PASSWORD=pgtrain",
+            "-p", f"{HOST_ADDR}:{HOST_PORT}:5432",
+            IMAGE,
+            "-c", f"shared_preload_libraries={PRELOAD}",
+        ])
+    # Wait for readiness. pg_isready over docker exec is NOT sufficient on first
+    # run: the official image's bootstrap phase listens on the unix socket only,
+    # so pg_isready passes while the published TCP port has nothing behind it.
+    # Gate on all three: pg_isready, a real SELECT, and the host port forwarding.
+    for _ in range(120):
+        if _docker(["exec", CONTAINER, "pg_isready", "-U", PGUSER, "-q"], check=False).returncode == 0 \
+                and psql_capture("SELECT 1", args=("-tA",)).returncode == 0 \
+                and _host_port_open():
+            return
+        time.sleep(0.5)
+    die(f"container {CONTAINER} did not become ready in time")
+
+
+def _host_port_open():
+    import socket
+    try:
+        with socket.create_connection((HOST_ADDR, int(HOST_PORT)), timeout=1):
+            return True
+    except OSError:
+        return False
+
+
+_HOST_DATA = None
+
+
+def host_data_ok():
+    """Can the HOST actually exchange bytes with Postgres over the published port?
+
+    Not just a TCP connect: a WireGuard-based VPN (NordLynx) lets connect()
+    succeed while dropping the Docker bridge's return packets, so app tasks that
+    connect from a host venv hang. We send a Postgres SSLRequest and require the
+    single-byte ('S'/'N') reply — driver-free, and it distinguishes 'connected'
+    from 'data actually flows'. Probed once per process; cached.
+    """
+    global _HOST_DATA
+    if _HOST_DATA is not None:
+        return _HOST_DATA
+    import socket
+    _HOST_DATA = False
+    try:
+        with socket.create_connection((HOST_ADDR, int(HOST_PORT)), timeout=2) as s:
+            s.sendall(struct.pack("!ii", 8, 80877103))  # length=8, SSLRequest code
+            s.settimeout(3)
+            _HOST_DATA = len(s.recv(1)) == 1
+    except OSError:
+        _HOST_DATA = False
+    return _HOST_DATA
+
+
+def psql_capture(sql, db="postgres", args=()):
+    """Run one SQL command, return CompletedProcess (stdout/stderr captured)."""
+    return _docker([
+        "exec", "-i", CONTAINER,
+        "psql", "-U", PGUSER, "-d", db, "-v", "ON_ERROR_STOP=1",
+        *args, "-c", sql,
+    ], check=False)
+
+
+def psql_script(script_text, db):
+    """Feed a whole script to psql via stdin. Returns CompletedProcess."""
+    return _docker([
+        "exec", "-i", CONTAINER,
+        "psql", "-U", PGUSER, "-d", db, "-v", "ON_ERROR_STOP=1", "-q", "-f", "-",
+    ], check=False, input=script_text)
+
+
+def _assert_safe_db(db):
+    if not db.startswith(DB_PREFIX) or not re.fullmatch(r"[a-z0-9_]+", db) or db == DB_PREFIX:
+        die(f"refusing to touch database '{db}' — not a pgtrain_ task database")
+
+
+def db_exists(db):
+    r = psql_capture(f"SELECT 1 FROM pg_database WHERE datname = '{db}'", args=("-tA",))
+    return r.returncode == 0 and r.stdout.strip() == "1"
+
+
+def create_db(db):
+    _assert_safe_db(db)
+    psql_capture(f'CREATE DATABASE "{db}"')
+
+
+def drop_db(db):
+    _assert_safe_db(db)
+    psql_capture(f'DROP DATABASE IF EXISTS "{db}" WITH (FORCE)')
+
+
+def recreate_seeded(db, seed_text):
+    drop_db(db)
+    create_db(db)
+    if seed_text.strip():
+        r = psql_script(seed_text, db)
+        if r.returncode != 0:
+            die(f"seed.sql failed for {db}:\n{r.stderr}")
+
+
+def list_task_dbs():
+    r = psql_capture(
+        f"SELECT datname FROM pg_database WHERE datname LIKE '{DB_PREFIX}%' ORDER BY 1",
+        args=("-tA",))
+    if r.returncode != 0:
+        return []
+    return [x for x in r.stdout.split("\n") if x.strip()]
+
+
+def dsn_for(db):
+    return f"postgresql://{PGUSER}@{HOST_ADDR}:{HOST_PORT}/{db}"
+
+
+# ---- workspace (query + app tasks) -----------------------------------------
+def ws_dir(tid):
+    return WORKSPACE / tid
+
+
+def populate_workspace(tid, meta, force=False):
+    """Lay down the learner's editable files for query/app tasks."""
+    src = meta["_dir"]
+    dst = ws_dir(tid)
+    kind = meta["kind"]
+    marker = dst / ("solution.sql" if kind == "query" else "solution.py")
+    if dst.exists() and any(dst.iterdir()) and not force:
+        return dst
+    if force and dst.exists():
+        backup = dst.with_name(dst.name + ".bak")
+        shutil.rmtree(backup, ignore_errors=True)
+        shutil.copytree(dst, backup)
+        shutil.rmtree(dst)
+        print(DIM(f"previous work backed up to {backup.relative_to(REPO)}"))
+    dst.mkdir(parents=True, exist_ok=True)
+    starter_dir = src / "starter"
+    if starter_dir.is_dir():
+        shutil.copytree(starter_dir, dst, dirs_exist_ok=True)
+    elif (src / "starter.sql").exists():
+        shutil.copy(src / "starter.sql", dst / "solution.sql")
+    elif kind == "query":
+        (dst / "solution.sql").write_text(
+            "-- Write your SELECT here. It must be a single statement.\n")
+    elif kind == "app":
+        (dst / "solution.py").write_text('"""Write your solution here — see the prompt."""\n')
+    return dst
+
+
+# ---- venv provisioning (app tasks) -----------------------------------------
+def _run(cmd):
+    return subprocess.run(cmd, check=True, capture_output=True, text=True,
+                          stdin=subprocess.DEVNULL).stdout
+
+
+def venv_for(deps):
+    """(python_exe, note): a cached venv holding pytest + deps. note != None => unavailable."""
+    deps = sorted(set(deps) | {"pytest"})
+    key = hashlib.sha256((sys.executable + "\n" + "\n".join(deps)).encode()).hexdigest()[:16]
+    vdir = VENVS / key
+    exe = vdir / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+    stamp = vdir / "ok.stamp"
+    if stamp.exists() and exe.exists():
+        return str(exe), None
+    VENVS.mkdir(parents=True, exist_ok=True)
+    lock = vdir.with_suffix(".lock")
+    try:
+        fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        os.close(fd)
+    except FileExistsError:
+        for _ in range(600):
+            if stamp.exists() and exe.exists():
+                return str(exe), None
+            if not lock.exists():
+                break
+            time.sleep(1)
+        return venv_for(deps)
+    try:
+        shutil.rmtree(vdir, ignore_errors=True)
+        uv = shutil.which("uv")
+        print(DIM(f"provisioning venv for [{', '.join(deps)}] (first run only)..."))
+        try:
+            if uv:
+                _run([uv, "venv", "--python", sys.executable, str(vdir)])
+                _run([uv, "pip", "install", "--python", str(exe), *deps])
+            else:
+                _run([sys.executable, "-m", "venv", str(vdir)])
+                _run([str(exe), "-m", "pip", "install", "--quiet", *deps])
+        except subprocess.CalledProcessError as e:
+            shutil.rmtree(vdir, ignore_errors=True)
+            tail = ((e.stderr or "") + (e.stdout or "")).strip().splitlines()[-3:]
+            return None, "could not install " + ", ".join(deps) + \
+                ("\n  " + "\n  ".join(tail) if tail else " — are you offline?")
+        stamp.write_text("\n".join(deps))
+        return str(exe), None
+    finally:
+        lock.unlink(missing_ok=True)
+
+
+# ---- result-set normalisation (query grading) ------------------------------
+def _fetch_rows(db, query):
+    """Run a SELECT and return (rows, error). rows is a list of tuples of cells."""
+    import csv
+    import io
+    q = query.strip().rstrip(";").strip()
+    if not q:
+        return None, "your solution.sql is empty"
+    copy = "COPY (\n" + q + "\n) TO STDOUT WITH (FORMAT csv, NULL '\\N')"
+    r = psql_capture(copy, db=db)
+    if r.returncode != 0:
+        return None, r.stderr.strip()
+    rows = []
+    for rec in csv.reader(io.StringIO(r.stdout)):
+        rows.append(tuple(None if cell == "\\N" else cell for cell in rec))
+    return rows, None
+
+
+def _canon_cell(cell):
+    if cell is None:
+        return "\x00NULL"
+    from decimal import Decimal, InvalidOperation
+    try:
+        return "\x01" + str(Decimal(cell).normalize())
+    except (InvalidOperation, ValueError):
+        return cell
+
+
+def _canon_row(row):
+    return tuple(_canon_cell(x) for x in row)
+
+
+def compare_result_sets(learner, reference, ordered):
+    """Return (ok, message)."""
+    if learner and reference and len(learner[0]) != len(reference[0]):
+        return False, (f"your query returns {len(learner[0])} column(s); "
+                       f"the answer has {len(reference[0])}")
+    lc = [_canon_row(r) for r in learner]
+    rc = [_canon_row(r) for r in reference]
+    if ordered:
+        if lc == rc:
+            return True, ""
+        return False, "rows differ (this task requires a specific ORDER BY)"
+    from collections import Counter
+    if Counter(lc) == Counter(rc):
+        return True, ""
+    lset, rset = Counter(lc), Counter(rc)
+    missing = list((rset - lset).elements())
+    extra = list((lset - rset).elements())
+    bits = []
+    if missing:
+        bits.append(f"{len(missing)} expected row(s) missing")
+    if extra:
+        bits.append(f"{len(extra)} unexpected row(s) present")
+    return False, "; ".join(bits) or "result sets differ"
+
+
+# ---- grading ---------------------------------------------------------------
+def grade_query(tid, meta, db=None):
+    """Grade a query task. If db is given (selftest), grade against it; else a
+    throwaway grading DB seeded fresh so the learner's psql tinkering never
+    affects the result."""
+    seed_text = (meta["_dir"] / "seed.sql").read_text() if (meta["_dir"] / "seed.sql").exists() else ""
+    grade_db = db or (task_db(tid) + "__grade")[:63]
+    if db is None:
+        recreate_seeded(grade_db, seed_text)
+    reference = (meta["_dir"] / "solution.sql").read_text()
+    learner_path = ws_dir(tid) / "solution.sql"
+    if not learner_path.exists():
+        return False, None, f"no workspace yet — run: pgtrain start {tid}"
+    learner_sql = learner_path.read_text()
+    ref_rows, ref_err = _fetch_rows(grade_db, reference)
+    if ref_err:
+        return False, None, f"internal: reference query failed:\n{ref_err}"
+    lrn_rows, lrn_err = _fetch_rows(grade_db, learner_sql)
+    if db is None:
+        drop_db(grade_db)
+    if lrn_err:
+        return False, None, f"your query raised an error:\n{lrn_err}"
+    ordered = bool(meta.get("ordered", False))
+    ok, msg = compare_result_sets(lrn_rows, ref_rows, ordered)
+    return ok, None, "" if ok else msg
+
+
+def _run_state_grader(grade_py, db, extra_env=None):
+    env = os.environ.copy()
+    env["PGTRAIN_DB"] = db
+    env["PGTRAIN_CONTAINER"] = CONTAINER
+    env["PGTRAIN_DSN"] = dsn_for(db)
+    env["PYTHONPATH"] = str(GRADER_LIB) + os.pathsep + env.get("PYTHONPATH", "")
+    if extra_env:
+        env.update(extra_env)
+    return subprocess.run([sys.executable, str(grade_py)], env=env,
+                          capture_output=True, text=True, stdin=subprocess.DEVNULL)
+
+
+def grade_state(tid, meta, db=None):
+    grade_db = db or task_db(tid)
+    if db is None and not db_exists(grade_db):
+        return False, None, f"no task database yet — run: pgtrain start {tid}"
+    proc = _run_state_grader(meta["_dir"] / "grade.py", grade_db)
+    return proc.returncode == 0, None, proc.stdout + proc.stderr
+
+
+def _venv_key(deps):
+    return hashlib.sha256(("cpython312\n" + "\n".join(sorted(set(deps) | {"pytest"}))).encode()).hexdigest()[:16]
+
+
+def run_app_pytest(meta, ws, db):
+    """Run a task's pytest grader against the live DB. Returns (returncode, note, output).
+
+    Primary path: the learner's host venv connects over the published port —
+    fast, and correct on CI / VPN-off. If the host cannot actually exchange data
+    with Postgres (NordLynx-style VPN), it transparently runs the SAME pytest in
+    an ephemeral container joined to the pgtrain network, where the DB is
+    reachable by name. Either way the grader and result are identical.
+    """
+    deps = meta.get("deps", [])
+    grader = meta["_dir"] / "test_grade.py"
+    if host_data_ok():
+        exe, note = venv_for(deps)
+        if note:
+            return None, note, ""
+        env = os.environ.copy()
+        env.update({
+            "PGTRAIN_WS": str(ws), "PGTRAIN_DB": db, "PGTRAIN_CONTAINER": CONTAINER,
+            "PGTRAIN_DSN": dsn_for(db), "PYTHONPATH": str(GRADER_LIB),
+        })
+        env.pop("PYTEST_ADDOPTS", None)
+        proc = subprocess.run(
+            [exe, "-m", "pytest", str(grader), "-q", "--no-header",
+             "-p", "no:cacheprovider", "--rootdir", str(ws), "-x", "--tb=short"],
+            capture_output=True, text=True, env=env, cwd=str(ws),
+            stdin=subprocess.DEVNULL, timeout=meta.get("timeout", 180),
+        )
+        return proc.returncode, None, proc.stdout + proc.stderr
+
+    # VPN fallback. A NordLynx-style VPN breaks the Docker bridge's return path,
+    # so BOTH the host->Postgres data path AND a bridge container's egress to
+    # PyPI are blocked — but the host network namespace still has egress, and
+    # container->container works. So we split into two container runs sharing one
+    # venv volume (same image => compatible venv):
+    #   provision  --network host       -> pip reaches PyPI
+    #   run pytest --network pgtrain-net -> reaches pgtrain-pg by name
+    key = _venv_key(deps)
+    pip_args = " ".join(shlex.quote(d) for d in sorted(set(deps) | {"pytest"}))
+    provision = (
+        "set -e\n"
+        f"V=/venvs/{key}\n"
+        f"exec 9>/venvs/{key}.lock\n"
+        "flock 9\n"
+        'if [ ! -f "$V/ok" ]; then\n'
+        '  rm -rf "$V"\n'
+        '  python -m venv "$V"\n'
+        f'  "$V/bin/pip" -q --disable-pip-version-check install {pip_args}\n'
+        '  touch "$V/ok"\n'
+        "fi\n"
+    )
+    p = subprocess.run(
+        ["docker", "run", "--rm", "--network", "host",
+         "-v", f"{VENV_VOLUME}:/venvs", "-v", f"{PIP_VOLUME}:/root/.cache/pip",
+         APP_IMAGE, "bash", "-lc", provision],
+        capture_output=True, text=True, stdin=subprocess.DEVNULL,
+        timeout=meta.get("timeout", 180) + 600,
+    )
+    if p.returncode != 0:
+        return p.returncode, None, "venv provisioning failed:\n" + p.stdout + p.stderr
+
+    container_dsn = f"postgresql://{PGUSER}@{CONTAINER}:5432/{db}"
+    run_pytest = (
+        "cd /ws\n"
+        f'exec /venvs/{key}/bin/pytest /task/test_grade.py -q --no-header '
+        "-p no:cacheprovider --rootdir /ws -x --tb=short\n"
+    )
+    run_args = ["docker", "run", "--rm", "--network", NETWORK]
+    # Run as the host user so any files created in the mounted workspace stay
+    # owned by the learner, and skip .pyc clutter in the read-only mounts.
+    if hasattr(os, "getuid"):
+        run_args += ["--user", f"{os.getuid()}:{os.getgid()}"]
+    run_args += [
+        "-e", "PGTRAIN_WS=/ws", "-e", f"PGTRAIN_DB={db}",
+        "-e", f"PGTRAIN_DSN={container_dsn}", "-e", f"PGTRAIN_CONTAINER={CONTAINER}",
+        "-e", "PYTHONPATH=/grader", "-e", "PYTHONDONTWRITEBYTECODE=1",
+        "-v", f"{GRADER_LIB}:/grader:ro",
+        "-v", f"{meta['_dir']}:/task:ro",
+        "-v", f"{ws}:/ws",
+        "-v", f"{VENV_VOLUME}:/venvs",
+        APP_IMAGE, "bash", "-lc", run_pytest,
+    ]
+    proc = subprocess.run(run_args, capture_output=True, text=True,
+                          stdin=subprocess.DEVNULL, timeout=meta.get("timeout", 180) + 120)
+    return proc.returncode, None, proc.stdout + proc.stderr
+
+
+def grade_app(tid, meta, db=None, ws=None):
+    grade_db = db or task_db(tid)
+    workspace = ws or ws_dir(tid)
+    seed_text = (meta["_dir"] / "seed.sql").read_text() if (meta["_dir"] / "seed.sql").exists() else ""
+    recreate_seeded(grade_db, seed_text)
+    rc, note, output = run_app_pytest(meta, workspace, grade_db)
+    if note:
+        return False, note, ""
+    return rc == 0, None, output
+
+
+GRADERS = {"query": grade_query, "state": grade_state, "app": grade_app}
+
+
+# ---- commands --------------------------------------------------------------
+def _stale_nag():
+    """Warn if lots of pgtrain_ databases linger."""
+    try:
+        n = len(list_task_dbs())
+    except Exception:
+        return
+    if n >= 12:
+        print(DIM(f"note: {n} pgtrain_ databases exist — `pgtrain gc` frees the space."))
+
+
+def cmd_list(args):
+    tasks = discover()
+    st = load_state()
+    only = args[0] if args else None
+    domains = {}
+    for tid, meta in tasks.items():
+        domains.setdefault(tid.split("/")[0], []).append((tid, meta))
+    if only and only not in domains:
+        die(f"no domain '{only}' (have: {', '.join(sorted(domains))})")
+    for dom in sorted(domains):
+        if only and dom != only:
+            continue
+        rows = domains[dom]
+        done = sum(1 for tid, _ in rows if st["tasks"].get(tid, {}).get("passed"))
+        print(f"\n{BLD(BLU(dom))} {DIM(f'({done}/{len(rows)})')}")
+        for tid, meta in rows:
+            rec = st["tasks"].get(tid, {})
+            mark = GRN("✓") if rec.get("passed") else (YEL("…") if rec.get("attempts") else DIM("·"))
+            stars = MAG("★" * meta.get("difficulty", 1))
+            kind = DIM(f"[{meta['kind']}]")
+            adv = YEL(" advanced") if "advanced" in meta.get("tags", []) else ""
+            print(f"  {mark} {tid.split('/', 1)[1]:<32} {stars:<16} {kind:<14} "
+                  f"{meta.get('title','')}{adv}")
+    if not only:
+        total = len(tasks)
+        done = sum(1 for t in tasks if st["tasks"].get(t, {}).get("passed"))
+        print(f"\n{BLD(f'{done}/{total} tasks complete')} — "
+              f"{st['xp']} XP, {st['streak']['count']}-day streak")
+    _stale_nag()
+
+
+def cmd_start(args):
+    if not args:
+        die("usage: pgtrain start <id>")
+    tasks = discover()
+    tid = resolve(tasks, args[0])
+    meta = tasks[tid]
+    ensure_up()
+    db = task_db(tid)
+    seed_text = (meta["_dir"] / "seed.sql").read_text() if (meta["_dir"] / "seed.sql").exists() else ""
+    recreate_seeded(db, seed_text)
+    if meta["kind"] in ("query", "app"):
+        ws = populate_workspace(tid, meta)
+    else:
+        ws = None
+    print(BLD(f"\n=== {meta.get('title','')} ") + DIM(f"[{tid}] · {meta['kind']}"))
+    print(DIM(f"difficulty {'★' * meta.get('difficulty', 1)} · ~{meta.get('est_min', '?')} min"
+              + (f" · needs: {', '.join(meta['deps'])}" if meta.get("deps") else "")))
+    print()
+    print((meta["_dir"] / "prompt.md").read_text())
+    print()
+    print(BLD("database:  ") + f"{db}  " + DIM(f"({dsn_for(db)})"))
+    if ws:
+        print(BLD("edit:      ") + str(ws.relative_to(REPO)) + "/")
+    if meta["kind"] == "state":
+        print(BLD("work here: ") + f"pgtrain psql {tid}")
+    print(DIM(f"when ready: pgtrain check {tid}"))
+
+
+def cmd_psql(args):
+    if not args:
+        die("usage: pgtrain psql <id>")
+    tasks = discover()
+    tid = resolve(tasks, args[0])
+    ensure_up()
+    db = task_db(tid)
+    if not db_exists(db):
+        print(DIM(f"database not found — creating it (same as `pgtrain start {tid}`)"))
+        seed_text = (tasks[tid]["_dir"] / "seed.sql")
+        recreate_seeded(db, seed_text.read_text() if seed_text.exists() else "")
+    os.execvp("docker", ["docker", "exec", "-it", CONTAINER,
+                         "psql", "-U", PGUSER, "-d", db])
+
+
+def cmd_check(args):
+    if not args:
+        die("usage: pgtrain check <id>")
+    tasks = discover()
+    tid = resolve(tasks, args[0])
+    meta = tasks[tid]
+    ensure_up()
+    if meta["kind"] == "app" and not host_data_ok():
+        print(DIM("note: host can't reach Postgres over TCP (VPN?) — "
+                  "grading app task inside a container on the pgtrain network"))
+    passed, skip_note, output = GRADERS[meta["kind"]](tid, meta)
+    st = load_state()
+    rec = st["tasks"].setdefault(tid, {"passed": False, "attempts": 0})
+    if skip_note:
+        print(YEL(f"SKIP: {skip_note}"))
+        return
+    rec["attempts"] += 1
+    if passed:
+        print(GRN(BLD("PASS")) + f" — {meta.get('title','')}")
+        if not rec["passed"]:
+            xp = XP_BY_DIFFICULTY.get(meta.get("difficulty", 1), 10)
+            st["xp"] += xp
+            bump_streak(st)
+            print(GRN(f"+{xp} XP") + DIM(f"  (total {st['xp']}, streak {st['streak']['count']})"))
+        rec["passed"] = True
+    else:
+        print(RED(BLD("FAIL")) + f" — {meta.get('title','')}\n")
+        print(_trim(output))
+        print(DIM(f"\nHint: pgtrain solution {tid} shows a reference answer."))
+    save_state(st)
+    if not passed:
+        sys.exit(1)
+
+
+def _trim(out):
+    out = out.strip()
+    if not out:
+        return DIM("(no output)")
+    return out if len(out) < 4000 else out[:4000] + "\n... (truncated)"
+
+
+def cmd_solution(args):
+    if not args:
+        die("usage: pgtrain solution <id>")
+    tasks = discover()
+    tid = resolve(tasks, args[0])
+    meta = tasks[tid]
+    print(BLD(f"Reference solution — {meta.get('title','')}"))
+    print(DIM("(one valid answer; any correct result/end-state passes)\n"))
+    sol_dir = meta["_dir"] / "solution"
+    if sol_dir.is_dir():
+        for f in sorted(sol_dir.rglob("*")):
+            if f.is_file():
+                print(BLU(f"--- {f.relative_to(sol_dir)} ---"))
+                print(f.read_text())
+    else:
+        for cand in ("solution.sql", "solution.py"):
+            p = meta["_dir"] / cand
+            if p.exists():
+                print(p.read_text())
+                break
+
+
+def cmd_reset(args):
+    if not args:
+        die("usage: pgtrain reset <id>")
+    tasks = discover()
+    tid = resolve(tasks, args[0])
+    meta = tasks[tid]
+    ensure_up()
+    db = task_db(tid)
+    seed_text = (meta["_dir"] / "seed.sql").read_text() if (meta["_dir"] / "seed.sql").exists() else ""
+    recreate_seeded(db, seed_text)
+    if meta["kind"] in ("query", "app"):
+        populate_workspace(tid, meta, force=True)
+    print(GRN(f"reset — {db} recreated from seed")
+          + (DIM(" and workspace restored") if meta["kind"] != "state" else ""))
+
+
+def cmd_status(_args):
+    tasks = discover()
+    st = load_state()
+    print(BLD(f"\nXP: {st['xp']}   streak: {st['streak']['count']} day(s)"
+              + (DIM(f"  (last active {st['streak']['last']})") if st['streak']['last'] else "")))
+    domains = {}
+    for tid in tasks:
+        domains.setdefault(tid.split("/")[0], []).append(tid)
+    print()
+    for dom in sorted(domains):
+        ids = domains[dom]
+        done = sum(1 for t in ids if st["tasks"].get(t, {}).get("passed"))
+        width = 24
+        filled = round(width * done / len(ids)) if ids else 0
+        bar = GRN("█" * filled) + DIM("░" * (width - filled))
+        print(f"  {dom:<16} {bar} {done}/{len(ids)}")
+    print()
+
+
+def cmd_up(_args):
+    ensure_up()
+    print(GRN(f"{CONTAINER} is up") + DIM(f"  ({dsn_for('pgtrain_<task>')})"))
+
+
+def cmd_down(_args):
+    _have_docker()
+    if container_state() == "running":
+        _docker(["stop", CONTAINER])
+        print(GRN(f"{CONTAINER} stopped") + DIM("  (task data preserved; `pgtrain up` to resume)"))
+    else:
+        print(DIM(f"{CONTAINER} is not running"))
+
+
+def cmd_gc(_args):
+    ensure_up(quiet=True)
+    dbs = list_task_dbs()
+    if not dbs:
+        print(DIM("no pgtrain_ databases to remove"))
+        return
+    for db in dbs:
+        drop_db(db)
+    print(GRN(f"dropped {len(dbs)} pgtrain_ database(s)"))
+
+
+def cmd_nuke(_args):
+    _have_docker()
+    removed = False
+    if container_state() != "absent":
+        _docker(["rm", "-f", CONTAINER])
+        removed = True
+    # These are all pgtrain-prefixed and owned by us — safe to remove.
+    _docker(["network", "rm", NETWORK], check=False)
+    _docker(["volume", "rm", VENV_VOLUME, PIP_VOLUME], check=False)
+    if removed:
+        print(GRN(f"removed container {CONTAINER}, network {NETWORK}, and pgtrain volumes")
+              + DIM("  (all task data destroyed)"))
+    else:
+        print(DIM(f"{CONTAINER} did not exist; cleaned up network/volumes if present"))
+
+
+def cmd_doctor(_args):
+    _have_docker()
+    state = container_state()
+    print(BLD("\npgtrain doctor"))
+    print(f"  container {CONTAINER}: " +
+          (GRN(state) if state == "running" else YEL(state)))
+    print(f"  image:       {IMAGE}")
+    print(f"  host port:   {HOST_ADDR}:{HOST_PORT} -> 5432")
+    if state == "running":
+        r = psql_capture("SHOW shared_preload_libraries", args=("-tA",))
+        print(f"  preloaded:   {r.stdout.strip() or '(none)'}")
+        reach = host_data_ok()
+        print(f"  host<->pg:   " + (GRN("data flows (app tasks use host venv)") if reach
+              else YEL("blocked (VPN?) — app tasks run inside a container")))
+        dbs = list_task_dbs()
+        print(f"  task DBs:    {len(dbs)}" + (DIM("  " + ", ".join(dbs)) if dbs else ""))
+    print()
+
+
+COMMANDS = {
+    "list": cmd_list, "start": cmd_start, "psql": cmd_psql, "check": cmd_check,
+    "solution": cmd_solution, "reset": cmd_reset, "status": cmd_status,
+    "up": cmd_up, "down": cmd_down, "gc": cmd_gc, "nuke": cmd_nuke, "doctor": cmd_doctor,
+}
+
+
+def main():
+    if sys.version_info < MIN_PY:
+        die(f"pgtrain needs Python >= {'.'.join(map(str, MIN_PY))}")
+    args = sys.argv[1:]
+    if not args or args[0] in ("-h", "--help", "help"):
+        print(__doc__.strip())
+        return
+    fn = COMMANDS.get(args[0])
+    if not fn:
+        die(f"unknown command '{args[0]}' (try: pgtrain help)")
+    fn(args[1:])
+
+
+if __name__ == "__main__":
+    main()
