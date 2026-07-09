@@ -1,0 +1,12 @@
+# learner working files
+workspace/*
+!workspace/.gitkeep
+
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+*.egg-info/
+dist/
+build/
+*.bak/
