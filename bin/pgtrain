@@ -20,13 +20,22 @@ SQL text. There are three kinds of task:
            Postgres.
 
 Usage:
+    pgtrain learn                # teach the next new task, then set it up to try
+    pgtrain train                # auto-pick what to do next (review or new) and start it
     pgtrain list [domain]        # all tasks, grouped by domain, with your status
     pgtrain start  <id>          # create the task's database (+ workspace) and show the spec
     pgtrain psql   <id>          # open an interactive psql shell on the task database
-    pgtrain check  <id>          # grade your work
-    pgtrain solution <id>        # reveal a reference solution
-    pgtrain reset  <id>          # drop & recreate the task database (and reset workspace files)
+    pgtrain check  [id]          # grade your work (defaults to the task you're on)
+    pgtrain solution [id]        # reveal a reference solution
+    pgtrain reset  [id]          # drop & recreate the task database (and reset workspace files)
     pgtrain status               # your XP, streak, and per-domain completion
+
+New to PostgreSQL?  Run `pgtrain learn` — it walks you through the concept behind
+the next task (running real queries against the practice database as you go),
+then sets it up so you can try it. Once you know the ropes, `pgtrain train` just
+picks what to practise next — new material in a fundamentals-first order, or a
+spaced-repetition review — so you don't have to decide. For check/solution/reset
+you can omit <id> to act on the task learn/train/start last gave you.
 
     pgtrain up                   # start the shared postgres:16 container
     pgtrain down                 # stop it (data is preserved)
@@ -67,6 +76,13 @@ STATE = STATE_DIR / "progress.json"
 VENVS = STATE_DIR / "venvs"
 MIN_PY = (3, 11)
 
+# How the learner invoked us, so hints name a command they can actually run.
+# SELF is the runnable path (e.g. ./bin/pgtrain) — used for hints that take an
+# <id>. INVOKE is what to suggest for the plain verbs: `make <verb>` when run
+# under make (MAKELEVEL is set), otherwise the same path.
+SELF = sys.argv[0] or "./bin/pgtrain"
+INVOKE = "make" if os.environ.get("MAKELEVEL") else SELF
+
 # ---- container / connection facts ------------------------------------------
 CONTAINER = os.environ.get("PGTRAIN_CONTAINER", "pgtrain-pg")
 IMAGE = os.environ.get("PGTRAIN_IMAGE", "postgres:16")
@@ -103,9 +119,13 @@ def die(msg):
 # ---- state -----------------------------------------------------------------
 def load_state():
     try:
-        return json.loads(STATE.read_text())
+        st = json.loads(STATE.read_text())
     except (FileNotFoundError, json.JSONDecodeError):
-        return {"tasks": {}, "xp": 0, "streak": {"count": 0, "last": ""}}
+        st = {"tasks": {}, "xp": 0, "streak": {"count": 0, "last": ""}}
+    # Fields added by train/learn; backfill so older progress files still load.
+    st.setdefault("current", None)
+    st.setdefault("recent_picks", [])
+    return st
 
 
 def save_state(st):
@@ -123,6 +143,36 @@ def bump_streak(st):
     else:
         s["count"] = 1
     s["last"] = today.isoformat()
+
+
+# ---- spaced repetition -----------------------------------------------------
+# Days until the next review, indexed by how many times you've passed the task.
+# After the table runs out we keep roughly doubling. Same ladder as the redhat
+# and pytrain trainers: quick early reinforcement, then widening gaps.
+REVIEW_INTERVALS = [1, 3, 7, 16, 35, 75]
+
+
+def review_interval(reps):
+    """Days until the next review after `reps` successful passes (reps >= 1)."""
+    i = max(reps, 1) - 1
+    if i < len(REVIEW_INTERVALS):
+        return REVIEW_INTERVALS[i]
+    return REVIEW_INTERVALS[-1] * (2 ** (i - len(REVIEW_INTERVALS) + 1))
+
+
+def days_overdue(iso_due):
+    """How many days past its review date a task is (>=0 means due now).
+    None if it has no scheduled review yet."""
+    if not iso_due:
+        return None
+    return date.today().toordinal() - date.fromisoformat(iso_due).toordinal()
+
+
+def schedule_review(entry, reps):
+    """Record the next review date `review_interval(reps)` days out."""
+    entry["reps"] = reps
+    due = date.fromordinal(date.today().toordinal() + review_interval(reps))
+    entry["due"] = due.isoformat()
 
 
 # ---- task discovery --------------------------------------------------------
@@ -155,7 +205,7 @@ def resolve(tasks, ident):
         return hits[0]
     if len(hits) > 1:
         die(f"'{ident}' is ambiguous: {', '.join(hits)}")
-    die(f"no task called '{ident}' (try: pgtrain list)")
+    die(f"no task called '{ident}' (try: {INVOKE} list)")
 
 
 def task_db(tid):
@@ -166,6 +216,129 @@ def task_db(tid):
         h = hashlib.sha1(tid.encode()).hexdigest()[:8]
         name = name[:51] + "_" + h
     return name
+
+
+# ---- what to teach next ----------------------------------------------------
+# Teaching order for NEW material: fundamentals first, then things that build on
+# them, heaviest/ecosystem domains last. Keyed by the task's domain directory;
+# anything unlisted sorts after these. Within a domain the nn- prefix already
+# runs easy->hard, so (domain rank, id) is the full teaching order.
+#
+# Rationale (each tier only leans on earlier ones), mirroring docs/objectives.md:
+#   sql          the SELECT itself — everything below reads/writes with it
+#   joins        combine tables — the next thing you reach for after WHERE
+#   aggregation  GROUP BY, window functions — summarise the rows you can select
+#   subqueries   subqueries & CTEs — compose queries out of queries
+#   datatypes    arrays, ranges, enums, JSONB — richer column shapes
+#   ddl          CREATE/ALTER & constraints — design the schema you've queried
+#   indexes      make those queries fast (needs a schema to index)
+#   txn          transactions & concurrency — correctness under load
+#   views        views & materialized views — package queries as objects
+#   plpgsql      functions, triggers & PL/pgSQL — server-side logic
+#   textsearch   full-text search & patterns
+#   security     roles, privileges & RLS
+#   admin        backup/restore, vacuum, config — operate a server
+#   replication  replication & HA — advanced multi-server ops
+#   app          app integration (SQLAlchemy, asyncpg, ...) — drive PG from code
+#   projects     multi-step capstones that combine everything
+DOMAIN_ORDER = {
+    "sql": 0, "joins": 1, "aggregation": 2, "subqueries": 3, "datatypes": 4,
+    "ddl": 5, "indexes": 6, "txn": 7, "views": 8, "plpgsql": 9,
+    "textsearch": 10, "security": 11, "admin": 12, "replication": 13,
+    "app": 14, "projects": 15,
+}
+
+
+def curriculum_key(tid):
+    """Sort key placing a task in teaching order: (domain rank, then its id)."""
+    return (DOMAIN_ORDER.get(tid.split("/")[0], 99), tid)
+
+
+def is_done(st, tid):
+    return bool(st["tasks"].get(tid, {}).get("passed"))
+
+
+def selectable(meta):
+    """Can this task be attempted here? App tasks need pip-installable deps that
+    aren't known until a venv build, so we don't gate on them — check reports
+    those as SKIP. Docker itself is the real gate and is handled at run time."""
+    return True
+
+
+def due_reviews(tasks, st):
+    """Passed tasks whose review date has arrived, most overdue first. A passed
+    task with no schedule yet (e.g. from before spaced repetition existed) counts
+    as due, so it re-enters the rotation."""
+    out = []
+    for tid, entry in st["tasks"].items():
+        if not entry.get("passed"):
+            continue
+        meta = tasks.get(tid)
+        if not meta or not selectable(meta):
+            continue
+        overdue = days_overdue(entry.get("due"))
+        if overdue is None or overdue >= 0:
+            out.append((overdue if overdue is not None else 0, tid, meta))
+    out.sort(key=lambda x: -x[0])           # most overdue first
+    return [(tid, meta) for _, tid, meta in out]
+
+
+def next_new(tasks, st):
+    """First not-yet-passed task in teaching order (fundamentals first). An
+    in-progress task counts as not-done, so this resumes unfinished work."""
+    for tid in sorted(tasks, key=curriculum_key):
+        if is_done(st, tid):
+            continue
+        if not selectable(tasks[tid]):
+            continue
+        return tid, tasks[tid]
+    return None
+
+
+def soonest_review(tasks, st):
+    """The nearest upcoming (not-yet-due) review, as (days_away, tid, meta)."""
+    best = None
+    for tid, entry in st["tasks"].items():
+        if not entry.get("passed"):
+            continue
+        meta = tasks.get(tid)
+        due = entry.get("due")
+        if not meta or not due:
+            continue
+        away = -days_overdue(due)
+        if away > 0 and (best is None or away < best[0]):
+            best = (away, tid, meta)
+    return best
+
+
+def choose_task(tasks, st):
+    """Decide what to practise next. Pure — no side effects, so it's testable.
+    Returns (tid, meta, kind, reason). kind is 'review', 'new', or None.
+
+    Reviews take priority once due, but never more than two in a row while new
+    material is still waiting, so new content always keeps advancing."""
+    reviews = due_reviews(tasks, st)
+    new = next_new(tasks, st)
+    recent = st.get("recent_picks", [])
+    review_wall = len(recent) >= 2 and recent[-1] == "review" and recent[-2] == "review"
+
+    if reviews and not (review_wall and new):
+        (tid, meta), kind = reviews[0], "review"
+    elif new:
+        (tid, meta), kind = new, "new"
+    elif reviews:                       # only reviews left (all new material done)
+        (tid, meta), kind = reviews[0], "review"
+    else:
+        return None, None, None, ""
+
+    if kind == "review":
+        overdue = days_overdue(st["tasks"][tid].get("due"))
+        reason = "due for review" if not overdue else f"review — {overdue}d overdue"
+    elif st["tasks"].get(tid, {}).get("attempts"):
+        reason = "resume — started but not yet passed"
+    else:
+        reason = "new material, next in sequence"
+    return tid, meta, kind, reason
 
 
 # ---- docker / postgres plumbing --------------------------------------------
@@ -483,7 +656,7 @@ def grade_query(tid, meta, db=None):
     reference = (meta["_dir"] / "solution.sql").read_text()
     learner_path = ws_dir(tid) / "solution.sql"
     if not learner_path.exists():
-        return False, None, f"no workspace yet — run: pgtrain start {tid}"
+        return False, None, f"no workspace yet — run: {SELF} start {tid}"
     learner_sql = learner_path.read_text()
     ref_rows, ref_err = _fetch_rows(grade_db, reference)
     if ref_err:
@@ -513,7 +686,7 @@ def _run_state_grader(grade_py, db, extra_env=None):
 def grade_state(tid, meta, db=None):
     grade_db = db or task_db(tid)
     if db is None and not db_exists(grade_db):
-        return False, None, f"no task database yet — run: pgtrain start {tid}"
+        return False, None, f"no task database yet — run: {SELF} start {tid}"
     proc = _run_state_grader(meta["_dir"] / "grade.py", grade_db)
     return proc.returncode == 0, None, proc.stdout + proc.stderr
 
@@ -675,15 +848,16 @@ def cmd_list(args):
         done = sum(1 for t in tasks if st["tasks"].get(t, {}).get("passed"))
         print(f"\n{BLD(f'{done}/{total} tasks complete')} — "
               f"{st['xp']} XP, {st['streak']['count']}-day streak")
+        print(DIM("New to this?  ") + BLD(f"{INVOKE} learn")
+              + DIM("  teaches the next one first."))
+        print(DIM("Know it already?  ") + BLD(f"{INVOKE} train")
+              + DIM("  just picks what to practise."))
     _stale_nag()
 
 
-def cmd_start(args):
-    if not args:
-        die("usage: pgtrain start <id>")
-    tasks = discover()
-    tid = resolve(tasks, args[0])
-    meta = tasks[tid]
+def launch_task(st, tid, meta):
+    """Seed the task's database (+ workspace), show its spec, and mark it the
+    current task. Shared by `start`, `train`, and `learn`. Returns the task db."""
     ensure_up()
     db = task_db(tid)
     seed_text = (meta["_dir"] / "seed.sql").read_text() if (meta["_dir"] / "seed.sql").exists() else ""
@@ -702,13 +876,217 @@ def cmd_start(args):
     if ws:
         print(BLD("edit:      ") + str(ws.relative_to(REPO)) + "/")
     if meta["kind"] == "state":
-        print(BLD("work here: ") + f"pgtrain psql {tid}")
-    print(DIM(f"when ready: pgtrain check {tid}"))
+        print(BLD("work here: ") + f"{SELF} psql {tid}")
+    print(DIM("when ready: ") + f"{INVOKE} check" + DIM(f"   (or: {SELF} check {tid})"))
+    st["current"] = tid
+    st["tasks"].setdefault(tid, {"passed": False, "attempts": 0})
+    save_state(st)
+    return db
+
+
+def cmd_start(args):
+    if not args:
+        die(f"usage: {SELF} start <id>   (or just: {INVOKE} train)")
+    tasks = discover()
+    st = load_state()
+    tid = resolve(tasks, args[0])
+    launch_task(st, tid, tasks[tid])
+
+
+def print_status_line(st):
+    done = sum(1 for t in st["tasks"].values() if t.get("passed"))
+    streak = st["streak"]["count"]
+    unit = "day" if streak == 1 else "days"
+    print(f"{BLD('XP')} {st['xp']}   {BLD('Streak')} {streak} {unit}   {BLD('Done')} {done}")
+
+
+def cmd_train(_args):
+    tasks = discover()
+    if not tasks:
+        print(DIM("no tasks found")); return
+    st = load_state()
+    tid, meta, kind, reason = choose_task(tasks, st)
+    if tid is None:
+        print()
+        print(GRN(BLD("All caught up — nothing due and no new tasks.")))
+        nxt = soonest_review(tasks, st)
+        if nxt:
+            print(DIM(f"Next review ({tasks[nxt[1]]['title']}) comes due in {nxt[0]}d."))
+        print()
+        print_status_line(st)
+        return
+    st["recent_picks"] = (st.get("recent_picks", []) + [kind])[-4:]
+    tag = YEL("REVIEW") if kind == "review" else GRN(" NEW  ")
+    print()
+    print_status_line(st)
+    print(f"{tag}  {DIM(reason)}")
+    if kind == "review":
+        print(DIM("(your last work is kept — re-solve from memory, or ")
+              + f"{SELF} reset {tid}" + DIM(" for a clean slate)"))
+    launch_task(st, tid, meta)
+
+
+# ---- learn: an interactive tutor -------------------------------------------
+def ask(msg):
+    """Prompt the learner; treat a closed stdin (piped/non-interactive) as Enter."""
+    try:
+        return input(msg).strip().lower()
+    except EOFError:
+        print()
+        return ""
+
+
+def parse_lesson(text):
+    """Split a lesson into a sequence of beats the tutor walks through:
+        ('prose', text)    a chunk of the lecture, printed as-is
+        ('pause', None)    a `---` line — wait for the learner before going on
+        ('run',  [lines])  a ```run fenced block — run as ONE psql script
+    A lesson with none of these markers is just one prose beat.
+
+    Lines inside a ```run block are captured VERBATIM (indentation and blank
+    lines preserved) so multi-statement SQL, DO blocks and CTEs survive — the
+    whole block is fed to psql as a single script by run_lesson."""
+    beats, buf, lines, i = [], [], text.splitlines(), 0
+
+    def flush():
+        if any(l.strip() for l in buf):
+            beats.append(("prose", "\n".join(buf).strip("\n")))
+        buf.clear()
+
+    while i < len(lines):
+        s = lines[i].strip()
+        if s == "---":
+            flush(); beats.append(("pause", None)); i += 1
+        elif s.startswith("```run"):
+            flush(); raw = []; i += 1
+            while i < len(lines) and not lines[i].strip().startswith("```"):
+                raw.append(lines[i]); i += 1      # verbatim — keep indentation
+            i += 1                                 # skip the closing fence
+            while raw and not raw[0].strip():  raw.pop(0)    # trim blank edges
+            while raw and not raw[-1].strip(): raw.pop()
+            if raw:
+                beats.append(("run", raw))
+        else:
+            buf.append(lines[i]); i += 1
+    flush()
+    return beats
+
+
+def run_lesson(beats, db):
+    """Walk the learner through a parsed lesson. Prose is paced with pauses; a
+    `run` block is shown, then executed live against the practice Postgres
+    database `db` (via `docker exec ... psql`) so the learner sees real query
+    output — the SQL analogue of pytrain running Python. The block is fed to
+    psql as ONE script (ON_ERROR_STOP off, so a slip in one statement still
+    shows its error and the rest runs). The learner can instead pick `t` to
+    open an interactive psql on the same database and type the SQL themselves
+    (Tab-completion, \\q to return). Returns False if the learner quit."""
+    for kind, payload in beats:
+        if kind == "prose":
+            print(payload)
+        elif kind == "pause":
+            if ask(DIM("\n  [Enter to continue · q to stop] ")) in ("q", "quit"):
+                return False
+            print()
+        elif kind == "run":
+            print()
+            print(BLD("  Try this — SQL, run against the practice database:"))
+            for line in payload:
+                print(GRN("    " + line))
+            ans = ask(DIM("  [Enter to run it here · t to type it yourself · s to skip · q to stop] "))
+            if ans in ("q", "quit"):
+                return False
+            if ans in ("s", "skip"):
+                continue
+            if ans in ("t", "type"):
+                if not (sys.stdin.isatty() and sys.stdout.isatty()):
+                    print(DIM("  no interactive terminal here — running it for you instead"))
+                else:
+                    print(DIM("  type SQL yourself; Tab completes; \\q to return to the lesson"))
+                    r = subprocess.run(
+                        ["docker", "exec", "-it", CONTAINER,
+                         "psql", "-U", PGUSER, "-d", db])
+                    if r.returncode != 0:
+                        print(DIM("  couldn't open an interactive psql — running it for you instead"))
+                    else:
+                        continue
+            print(DIM("  ── output " + "─" * 40))
+            subprocess.run(
+                ["docker", "exec", "-i", CONTAINER,
+                 "psql", "-U", PGUSER, "-d", db, "-v", "ON_ERROR_STOP=0"],
+                input="\n".join(payload) + "\n", text=True,
+            )
+            print(DIM("  " + "─" * 49))
+    return True
+
+
+def cmd_learn(args):
+    """Teach a task like a tutor: a paced lecture from learn.md whose ```run
+    steps execute against the practice Postgres as you go, then hand off to a
+    solo attempt. With no id it teaches the next new task — the one `train`
+    would give you."""
+    tasks = discover()
+    if not tasks:
+        print(DIM("no tasks found")); return
+    st = load_state()
+    if args:
+        tid = resolve(tasks, args[0])
+    else:
+        nxt = next_new(tasks, st)
+        if nxt is None:
+            print(DIM("You've passed every task already. "
+                      "Revisit a lesson with:  ") + f"{SELF} learn <id>")
+            return
+        tid = nxt[0]
+    meta = tasks[tid]
+    short = tid.split("/", 1)[1]
+    print(BLD(f"\nLESSON — {meta.get('domain','')}: {meta.get('title','')}") + DIM(f"  [{tid}]"))
+    print(DIM(f"objective: {meta.get('objective','')}"))
+    print("─" * 60)
+
+    lesson = meta["_dir"] / "learn.md"
+    if not lesson.exists():
+        print(DIM("No written lesson for this task yet — read the spec, give it a"))
+        print(DIM("go, and reveal a worked solution with  ") + f"{INVOKE} solution")
+        print("\n" + (meta["_dir"] / "prompt.md").read_text().rstrip())
+        print("─" * 60)
+        if ask(BLD("Set up its database/workspace so you can try it? ")
+               + DIM("[Enter = yes, q = later] ")) not in ("q", "quit"):
+            launch_task(st, tid, meta)
+        else:
+            print(DIM("When you're ready:  ") + f"{SELF} start {short}")
+        return
+
+    # Seed the task's database first, so the walkthrough's live queries run
+    # against the same tables the task uses. The solo attempt below re-seeds it
+    # to a clean slate, so anything the lesson creates/alters doesn't linger.
+    print(DIM("Setting up the practice database to follow along on...\n"))
+    ensure_up()
+    db = task_db(tid)
+    seed_text = (meta["_dir"] / "seed.sql").read_text() if (meta["_dir"] / "seed.sql").exists() else ""
+    recreate_seeded(db, seed_text)
+    entry = st["tasks"].setdefault(tid, {"passed": False, "attempts": 0})
+    st["current"] = tid
+    save_state(st)
+
+    finished = run_lesson(parse_lesson(lesson.read_text()), db)
+    print("─" * 60)
+    if not finished:
+        print(DIM("Lesson paused. Pick it back up any time:  ") + f"{SELF} learn {short}")
+        return
+    print(GRN("That's the lesson.")
+          + DIM("  Best way to make it stick is to do it yourself."))
+    if ask(BLD("Set up a clean slate and try it now? ")
+           + DIM("[Enter = yes, q = later] ")) not in ("q", "quit"):
+        launch_task(st, tid, meta)
+    else:
+        print(DIM("When you're ready:  ") + f"{SELF} start {short}"
+              + DIM("  or  ") + f"{SELF} learn {short}")
 
 
 def cmd_psql(args):
     if not args:
-        die("usage: pgtrain psql <id>")
+        die(f"usage: {SELF} psql <id>")
     tasks = discover()
     tid = resolve(tasks, args[0])
     ensure_up()
@@ -722,34 +1100,46 @@ def cmd_psql(args):
 
 
 def cmd_check(args):
-    if not args:
-        die("usage: pgtrain check <id>")
     tasks = discover()
-    tid = resolve(tasks, args[0])
+    st = load_state()
+    ident = args[0] if args else st.get("current")
+    if not ident:
+        die(f"nothing to check — run '{INVOKE} train' first, "
+            f"or name a task: {SELF} check <id>")
+    tid = resolve(tasks, ident)
     meta = tasks[tid]
     ensure_up()
     if meta["kind"] == "app" and not host_data_ok():
         print(DIM("note: host can't reach Postgres over TCP (VPN?) — "
                   "grading app task inside a container on the pgtrain network"))
+    print(BLD(f"\nGrading: {meta.get('title','')}"))
     passed, skip_note, output = GRADERS[meta["kind"]](tid, meta)
-    st = load_state()
     rec = st["tasks"].setdefault(tid, {"passed": False, "attempts": 0})
     if skip_note:
         print(YEL(f"SKIP: {skip_note}"))
         return
     rec["attempts"] += 1
     if passed:
+        was_review = rec.get("passed", False)
         print(GRN(BLD("PASS")) + f" — {meta.get('title','')}")
-        if not rec["passed"]:
-            xp = XP_BY_DIFFICULTY.get(meta.get("difficulty", 1), 10)
-            st["xp"] += xp
-            bump_streak(st)
-            print(GRN(f"+{xp} XP") + DIM(f"  (total {st['xp']}, streak {st['streak']['count']})"))
+        if was_review:
+            reps, xp = rec.get("reps", 1) + 1, 5     # cheaper: you already know it
+        else:
+            reps, xp = 1, XP_BY_DIFFICULTY.get(meta.get("difficulty", 1), 10)
         rec["passed"] = True
+        schedule_review(rec, reps)
+        st["xp"] += xp
+        bump_streak(st)
+        print(GRN(f"+{xp} XP") + DIM(f"  (total {st['xp']}, streak {st['streak']['count']})"))
+        print(DIM(f"Next review in {review_interval(reps)}d.  Next task:  ") + f"{INVOKE} train")
     else:
+        if rec.get("passed"):        # a lapse — relearn from the start, soon
+            rec["reps"] = 0
+            rec["due"] = date.today().isoformat()
         print(RED(BLD("FAIL")) + f" — {meta.get('title','')}\n")
         print(_trim(output))
-        print(DIM(f"\nHint: pgtrain solution {tid} shows a reference answer."))
+        print(DIM("\nFix it and re-run  ") + f"{INVOKE} check"
+              + DIM("   (stuck?  ") + f"{SELF} solution {tid}" + DIM(")"))
     save_state(st)
     if not passed:
         sys.exit(1)
@@ -763,10 +1153,12 @@ def _trim(out):
 
 
 def cmd_solution(args):
-    if not args:
-        die("usage: pgtrain solution <id>")
     tasks = discover()
-    tid = resolve(tasks, args[0])
+    st = load_state()
+    ident = args[0] if args else st.get("current")
+    if not ident:
+        die(f"nothing to show — name a task: {SELF} solution <id>")
+    tid = resolve(tasks, ident)
     meta = tasks[tid]
     print(BLD(f"Reference solution — {meta.get('title','')}"))
     print(DIM("(one valid answer; any correct result/end-state passes)\n"))
@@ -785,10 +1177,12 @@ def cmd_solution(args):
 
 
 def cmd_reset(args):
-    if not args:
-        die("usage: pgtrain reset <id>")
     tasks = discover()
-    tid = resolve(tasks, args[0])
+    st = load_state()
+    ident = args[0] if args else st.get("current")
+    if not ident:
+        die(f"nothing to reset — name a task: {SELF} reset <id>")
+    tid = resolve(tasks, ident)
     meta = tasks[tid]
     ensure_up()
     db = task_db(tid)
@@ -880,6 +1274,7 @@ def cmd_doctor(_args):
 
 
 COMMANDS = {
+    "learn": cmd_learn, "train": cmd_train, "next": cmd_train,
     "list": cmd_list, "start": cmd_start, "psql": cmd_psql, "check": cmd_check,
     "solution": cmd_solution, "reset": cmd_reset, "status": cmd_status,
     "up": cmd_up, "down": cmd_down, "gc": cmd_gc, "nuke": cmd_nuke, "doctor": cmd_doctor,
@@ -895,7 +1290,7 @@ def main():
         return
     fn = COMMANDS.get(args[0])
     if not fn:
-        die(f"unknown command '{args[0]}' (try: pgtrain help)")
+        die(f"unknown command '{args[0]}' (try: {INVOKE} help)")
     fn(args[1:])
 
 
