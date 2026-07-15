@@ -978,7 +978,9 @@ def run_lesson(beats, db):
     database `db` (via `docker exec ... psql`) so the learner sees real query
     output — the SQL analogue of pytrain running Python. The block is fed to
     psql as ONE script (ON_ERROR_STOP off, so a slip in one statement still
-    shows its error and the rest runs). Returns False if the learner quit."""
+    shows its error and the rest runs). The learner can instead pick `t` to
+    open an interactive psql on the same database and type the SQL themselves
+    (Tab-completion, \\q to return). Returns False if the learner quit."""
     for kind, payload in beats:
         if kind == "prose":
             print(payload)
@@ -991,11 +993,23 @@ def run_lesson(beats, db):
             print(BLD("  Try this — SQL, run against the practice database:"))
             for line in payload:
                 print(GRN("    " + line))
-            ans = ask(DIM("  [Enter to run it here · s to skip · q to stop] "))
+            ans = ask(DIM("  [Enter to run it here · t to type it yourself · s to skip · q to stop] "))
             if ans in ("q", "quit"):
                 return False
             if ans in ("s", "skip"):
                 continue
+            if ans in ("t", "type"):
+                if not (sys.stdin.isatty() and sys.stdout.isatty()):
+                    print(DIM("  no interactive terminal here — running it for you instead"))
+                else:
+                    print(DIM("  type SQL yourself; Tab completes; \\q to return to the lesson"))
+                    r = subprocess.run(
+                        ["docker", "exec", "-it", CONTAINER,
+                         "psql", "-U", PGUSER, "-d", db])
+                    if r.returncode != 0:
+                        print(DIM("  couldn't open an interactive psql — running it for you instead"))
+                    else:
+                        continue
             print(DIM("  ── output " + "─" * 40))
             subprocess.run(
                 ["docker", "exec", "-i", CONTAINER,
