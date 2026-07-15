@@ -1,0 +1,9 @@
+{
+  "title": "Index a hot lookup column",
+  "domain": "indexes",
+  "objective": "Indexes & performance: create a btree index so a point lookup uses an Index Scan, not a Seq Scan",
+  "kind": "state",
+  "difficulty": 2,
+  "est_min": 10,
+  "tags": []
+}

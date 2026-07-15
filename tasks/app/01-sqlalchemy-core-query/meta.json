@@ -1,0 +1,10 @@
+{
+  "title": "SQLAlchemy Core: aggregate against live Postgres",
+  "domain": "app",
+  "objective": "App integration: query a live Postgres with SQLAlchemy Core (reflection, group-by aggregate, ordering)",
+  "kind": "app",
+  "difficulty": 2,
+  "est_min": 15,
+  "deps": ["sqlalchemy", "psycopg[binary]"],
+  "tags": []
+}

@@ -1,0 +1,10 @@
+{
+  "title": "Filter rows with WHERE",
+  "domain": "sql",
+  "objective": "SQL fundamentals: WHERE predicates incl. boundary conditions and AND",
+  "kind": "query",
+  "difficulty": 1,
+  "est_min": 5,
+  "ordered": false,
+  "tags": []
+}

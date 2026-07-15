@@ -1,0 +1,33 @@
+name: selftest
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  selftest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Pull images
+        run: |
+          docker pull postgres:16
+          docker pull python:3.12
+
+      - name: Diagnostics (which grading path will CI take?)
+        run: |
+          ./bin/pgtrain up
+          ./bin/pgtrain doctor
+
+      - name: Run the full selftest (SQL, state, and app tasks)
+        run: PYTHONUNBUFFERED=1 ./selftest.py -j 1
