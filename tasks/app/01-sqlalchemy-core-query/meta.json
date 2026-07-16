@@ -6,5 +6,6 @@
   "difficulty": 2,
   "est_min": 15,
   "deps": ["sqlalchemy", "psycopg[binary]"],
+  "prereq": ["foundations/01-meet-the-database"],
   "tags": []
 }

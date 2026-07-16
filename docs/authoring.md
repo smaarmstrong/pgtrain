@@ -28,6 +28,9 @@ Every task has:
   "est_min": 10,
   "deps": ["sqlalchemy", "psycopg[binary]"],  // app tasks only
   "ordered": false,         // query tasks: true if the task mandates ORDER BY
+  "prereq": ["foundations/01-meet-the-database"],  // optional: SOFT pointers to
+                            // foundations lessons this task leans on; unmet ->
+                            // one-line advisory in learn/train, never a gate
   "tags": ["advanced"]      // optional
 }
 ```

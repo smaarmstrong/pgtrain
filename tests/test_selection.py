@@ -117,6 +117,42 @@ st = blank_state(tasks={t: {"passed": True, "due": iso(30)} for t in TASKS})
 tid, meta, kind, reason = r.choose_task(TASKS, st)
 check("choose_task returns None when caught up", tid is None and kind is None)
 
+# ---- foundations sorts first ------------------------------------------------
+T_FOUND = dict(TASKS)
+T_FOUND["foundations/01-e"] = {"title": "e", "domain": "foundations"}
+check("curriculum_key sorts foundations before sql",
+      sorted(T_FOUND, key=r.curriculum_key)[0] == "foundations/01-e")
+check("next_new on a clean slate starts at foundations",
+      r.next_new(T_FOUND, blank_state())[0] == "foundations/01-e")
+
+# ---- prereq advisory: prints when unmet, silent once passed, never resolves
+# ambiguously -------------------------------------------------------------
+import contextlib
+import io
+
+T_PRE = {
+    "foundations/01-e": {"title": "psql basics", "domain": "foundations"},
+    "sql/01-a": {"title": "a", "domain": "sql", "prereq": ["foundations/01-e"]},
+    "sql/02-b": {"title": "b", "domain": "sql", "prereq": ["01-e"]},  # short id
+}
+
+def advice_output(st, tid):
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        r.prereq_advice(T_PRE, st, tid)
+    return buf.getvalue()
+
+out = advice_output(blank_state(), "sql/01-a")
+check("prereq_advice nudges when the prereq is unmet",
+      "learn 01-e" in out and "psql basics" in out)
+check("prereq_advice resolves a short prereq id",
+      "learn 01-e" in advice_output(blank_state(), "sql/02-b"))
+st = blank_state(tasks={"foundations/01-e": {"passed": True}})
+check("prereq_advice is silent once the prereq is passed",
+      advice_output(st, "sql/01-a") == "")
+check("prereq_advice is silent for a task with no prereq",
+      advice_output(blank_state(), "foundations/01-e") == "")
+
 # ---- lesson parsing (```run block is SQL, kept verbatim) -------------------
 beats = r.parse_lesson("intro line\n---\nmore prose\n```run\nSELECT 1;\nSELECT 2;\n```\ntail")
 kinds = [b[0] for b in beats]

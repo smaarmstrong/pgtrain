@@ -1,0 +1,11 @@
+{
+  "title": "Your first queries: SELECT, *, and LIMIT",
+  "domain": "foundations",
+  "objective": "Foundations: first queries — SELECT columns FROM table, *, and LIMIT, as pure mechanics",
+  "kind": "query",
+  "difficulty": 1,
+  "est_min": 8,
+  "ordered": false,
+  "prereq": ["foundations/01-meet-the-database"],
+  "tags": []
+}

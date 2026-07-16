@@ -59,9 +59,17 @@ counts consecutive days with at least one pass.
 
 ## Domains
 
-`sql` · `joins` · `aggregation` · `subqueries` · `datatypes` · `ddl` ·
-`indexes` · `txn` · `views` · `plpgsql` · `textsearch` · `security` · `admin` ·
-`replication` · `app` · `projects`.
+`foundations` · `sql` · `joins` · `aggregation` · `subqueries` · `datatypes` ·
+`ddl` · `indexes` · `txn` · `views` · `plpgsql` · `textsearch` · `security` ·
+`admin` · `replication` · `app` · `projects`.
+
+`foundations` comes first in the teaching order: interactive lessons that
+teach the ambient tools everything else assumes — what a server/database even
+is, psql and its meta-commands, bare `SELECT` mechanics, reading Postgres
+errors, and why the Docker sandbox means you can't break anything. Tasks that
+lean on a foundations lesson list it as a soft `prereq` in their `meta.json`;
+if you haven't passed it yet, `learn`/`train` print a one-line pointer to it —
+advisory only, never a gate.
 
 The full coverage checklist is [docs/objectives.md](docs/objectives.md); the
 task-authoring guide is [docs/authoring.md](docs/authoring.md).

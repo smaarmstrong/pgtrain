@@ -19,7 +19,22 @@ Task kinds: `query` (write a SELECT, result sets compared) · `state` (apply
 DDL/DML/admin, end state asserted via catalogs / EXPLAIN / behaviour probes) ·
 `app` (edit Python, pytest in a venv against the live database).
 
+A task's `meta.json` may also list `prereq` — ids of foundations lessons it
+quietly leans on. Unmet prerequisites print a one-line advisory in
+`learn`/`train`; they never gate anything.
+
 ---
+
+## foundations — the trainer's own tools (target 4)
+
+Interactive lessons that teach the ambient tooling every other task assumes —
+sorted first in the teaching order, written for someone who knows almost
+nothing yet.
+
+- [x] what you're talking to: server vs client, the container, databases; psql and `\l` `\c` `\dt` `\d` `\q`
+- [x] first queries: `SELECT columns FROM table`, `*`, and `LIMIT`, as pure mechanics
+- [x] anatomy of a Postgres error (`ERROR`/`DETAIL`/`HINT`, position marker), classic beginner mistakes decoded, and reading result sets incl. `NULL`
+- [x] the safety net: the Docker sandbox, resetting a task, and `BEGIN`/`ROLLBACK` as a personal undo
 
 ## sql — SQL fundamentals (target 12)
 - [x] `WHERE` predicates: comparison, `AND`/`OR`/`NOT`, boundary conditions
