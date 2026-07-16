@@ -1,0 +1,10 @@
+{
+  "title": "You can't break anything: sandbox, reset, ROLLBACK",
+  "domain": "foundations",
+  "objective": "Foundations: the safety net — the Docker sandbox, resetting a task, and BEGIN/ROLLBACK as a personal undo",
+  "kind": "state",
+  "difficulty": 1,
+  "est_min": 8,
+  "prereq": ["foundations/01-meet-the-database"],
+  "tags": []
+}

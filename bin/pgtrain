@@ -225,6 +225,9 @@ def task_db(tid):
 # runs easy->hard, so (domain rank, id) is the full teaching order.
 #
 # Rationale (each tier only leans on earlier ones), mirroring docs/objectives.md:
+#   foundations  the trainer's own ambient tools — what a server/database IS,
+#                psql and its meta-commands, bare SELECT mechanics, reading
+#                errors, the sandbox — taught before anything assumes them
 #   sql          the SELECT itself — everything below reads/writes with it
 #   joins        combine tables — the next thing you reach for after WHERE
 #   aggregation  GROUP BY, window functions — summarise the rows you can select
@@ -242,16 +245,38 @@ def task_db(tid):
 #   app          app integration (SQLAlchemy, asyncpg, ...) — drive PG from code
 #   projects     multi-step capstones that combine everything
 DOMAIN_ORDER = {
-    "sql": 0, "joins": 1, "aggregation": 2, "subqueries": 3, "datatypes": 4,
-    "ddl": 5, "indexes": 6, "txn": 7, "views": 8, "plpgsql": 9,
-    "textsearch": 10, "security": 11, "admin": 12, "replication": 13,
-    "app": 14, "projects": 15,
+    "foundations": 0,
+    "sql": 1, "joins": 2, "aggregation": 3, "subqueries": 4, "datatypes": 5,
+    "ddl": 6, "indexes": 7, "txn": 8, "views": 9, "plpgsql": 10,
+    "textsearch": 11, "security": 12, "admin": 13, "replication": 14,
+    "app": 15, "projects": 16,
 }
 
 
 def curriculum_key(tid):
     """Sort key placing a task in teaching order: (domain rank, then its id)."""
     return (DOMAIN_ORDER.get(tid.split("/")[0], 99), tid)
+
+
+def prereq_advice(tasks, st, tid):
+    """SOFT prerequisite pointers. A task's meta.json may list `prereq` — ids of
+    foundations lessons it leans on (e.g. psql basics, bare SELECTs). If the
+    learner hasn't passed one yet, print a one-line nudge to learn it first.
+    Advisory only: it NEVER blocks or changes what runs, and it goes silent
+    once the prerequisite is passed."""
+    for pid in tasks[tid].get("prereq", []):
+        p = pid if pid in tasks else None
+        if p is None:                     # allow a short id, same as resolve()
+            hits = [t for t in tasks if t.split("/", 1)[1] == pid]
+            p = hits[0] if len(hits) == 1 else None
+        if p is None or p == tid:
+            continue
+        if st["tasks"].get(p, {}).get("passed"):
+            continue
+        short = p.split("/", 1)[1]
+        print(YEL("heads-up") + DIM('  this task leans on "')
+              + tasks[p].get("title", short)
+              + DIM('" — new to it? learn it first:  ') + BLD(f"{SELF} learn {short}"))
 
 
 def is_done(st, tid):
@@ -923,6 +948,7 @@ def cmd_train(_args):
     if kind == "review":
         print(DIM("(your last work is kept — re-solve from memory, or ")
               + f"{SELF} reset {tid}" + DIM(" for a clean slate)"))
+    prereq_advice(tasks, st, tid)
     launch_task(st, tid, meta)
 
 
@@ -1042,6 +1068,7 @@ def cmd_learn(args):
     short = tid.split("/", 1)[1]
     print(BLD(f"\nLESSON — {meta.get('domain','')}: {meta.get('title','')}") + DIM(f"  [{tid}]"))
     print(DIM(f"objective: {meta.get('objective','')}"))
+    prereq_advice(tasks, st, tid)
     print("─" * 60)
 
     lesson = meta["_dir"] / "learn.md"

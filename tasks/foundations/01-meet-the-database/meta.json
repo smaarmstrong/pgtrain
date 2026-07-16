@@ -1,0 +1,10 @@
+{
+  "title": "Meet the database: psql and the meta-commands",
+  "domain": "foundations",
+  "objective": "Foundations: what you're talking to — server vs client, the container, databases; psql and \\l \\c \\dt \\d \\q",
+  "kind": "query",
+  "difficulty": 1,
+  "est_min": 10,
+  "ordered": false,
+  "tags": []
+}

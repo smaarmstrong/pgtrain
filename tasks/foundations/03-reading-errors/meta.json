@@ -1,0 +1,11 @@
+{
+  "title": "Reading errors and query output",
+  "domain": "foundations",
+  "objective": "Foundations: anatomy of a Postgres error (ERROR/DETAIL/HINT, position marker), classic beginner mistakes decoded, and reading result sets incl. NULL",
+  "kind": "query",
+  "difficulty": 1,
+  "est_min": 10,
+  "ordered": false,
+  "prereq": ["foundations/02-first-selects"],
+  "tags": []
+}

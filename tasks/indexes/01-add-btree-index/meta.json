@@ -5,5 +5,6 @@
   "kind": "state",
   "difficulty": 2,
   "est_min": 10,
+  "prereq": ["foundations/01-meet-the-database"],
   "tags": []
 }
