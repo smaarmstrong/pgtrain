@@ -45,8 +45,8 @@ you can omit <id> to act on the task learn/train/start last gave you.
 
 <id> is "domain/nn-name" or just the unique trailing name.
 
-The only hard requirement is Docker. The runner itself is Python >= 3.11,
-standard library only. SQL/state tasks talk to Postgres through
+The only hard requirement is Docker. The runner itself is Python >= 3.8,
+standard library only (works on the stock python3 of Rocky/RHEL 9 and 10). SQL/state tasks talk to Postgres through
 `docker exec ... psql` — no host psql, no driver needed. App tasks additionally
 provision a per-dependency-set venv (uv if present, else venv+pip).
 
@@ -74,7 +74,7 @@ GRADER_LIB = REPO / "grader"
 STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "pgtrain"
 STATE = STATE_DIR / "progress.json"
 VENVS = STATE_DIR / "venvs"
-MIN_PY = (3, 11)
+MIN_PY = (3, 8)  # true floor per the stdlib features used (shutil.copytree dirs_exist_ok)
 
 # How the learner invoked us, so hints name a command they can actually run.
 # SELF is the runnable path (e.g. ./bin/pgtrain) — used for hints that take an
